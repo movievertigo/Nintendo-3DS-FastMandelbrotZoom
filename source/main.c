@@ -12,13 +12,16 @@
 #define INITIALTARGETY 0.0
 #define INITIALSIZE 3.1
 #define COLOURTABLESIZE 64
+#define TIMELIMIT (1000000 * 88/100 / 60)
+#define SPLITS 8
 
 double targetX = INITIALTARGETX, targetY = INITIALTARGETY, size = INITIALSIZE;
-u32 iterations = INITIALITERATIONS;
+int iterations = INITIALITERATIONS;
 
 bool quit = false;
 bool drawfull = true;
 bool fixRowNext = true;
+u64 startTime;
 
 u8 fontData[fontTilesLen];
 u16 colourTable[COLOURTABLESIZE];
@@ -146,25 +149,61 @@ inline int mandelbrotpixel(double pX, double pY)
     double x2 = x*x;
     double y2 = y*y;
 
-    int i = 1;
-    for (; x2 + y2 < 4.0f && i < iterations; ++i)
+    int i = 0;
+    while (++i < iterations && x2 + y2 < 4.0)
     {
-        y = (x+x) * y + pY;
-        x = x2 - y2 + pX;
+        y = pY + 2 * x * y;
+        x = pX + x2 - y2;
         x2 = x*x;
         y2 = y*y;
     }
     return i;
 }
 
-inline void mandelbrotcol(u16* ptr, double pX)
+inline bool mandelbrotsplitcol(u16* ptr, double pX)
 {
-    for (int row = 0; row < SCREENHEIGHT; ++row)
+    for (int split = 0; split < SPLITS; ++split)
     {
-        int i = mandelbrotpixel(pX, rowYValues[row]);
-        *ptr = i == iterations ? 0 : colourTable[i%COLOURTABLESIZE];
-        ++ptr;
+        if (getusec()-startTime > TIMELIMIT)
+        {
+            return false;
+        }
+
+        int start = split * (SCREENHEIGHT/SPLITS);
+        int end = (split+1) * (SCREENHEIGHT/SPLITS);
+
+        for (int row = start; row < end; ++row)
+        {
+            int i = mandelbrotpixel(pX, rowYValues[row]);
+            *ptr = i == iterations ? 0 : colourTable[i%COLOURTABLESIZE];
+            ++ptr;
+        }
     }
+
+    return true;
+}
+
+inline bool mandelbrotsplitrow(u16* ptr, double pY)
+{
+    for (int split = 0; split < SPLITS; ++split)
+    {
+        if (getusec()-startTime > TIMELIMIT)
+        {
+            return false;
+        }
+
+        int start = split * (SCREENWIDTH/SPLITS);
+        int end = (split+1) * (SCREENWIDTH/SPLITS);
+    
+        for (int col = start; col < end; ++col)
+        {
+            int i = mandelbrotpixel(colXValues[col], pY);
+            *ptr = i == iterations ? 0 : colourTable[i%COLOURTABLESIZE];
+            ptr += SCREENHEIGHT;
+        }
+    }
+
+    return true;
 }
 
 inline void mandelbrotrow(u16* ptr, double pY)
@@ -254,7 +293,7 @@ void scale(u16* srcBuffer, u16* dstBuffer)
     }
 }
 
-void fixworstcol(u16* buffer)
+bool fixworstcol(u16* buffer)
 {
     double worstError = 0.0;
     int worstCol = 0;
@@ -270,12 +309,19 @@ void fixworstcol(u16* buffer)
     double sizeX = (SCREENWIDTH * size) / SCREENHEIGHT;
     double minX = targetX - sizeX/2;
     double pX = minX + (worstCol * sizeX) / SCREENWIDTH;
-    colXValues[worstCol] = pX;
-    colErrors[worstCol] = 0.0;
-    mandelbrotcol(buffer+worstCol*SCREENHEIGHT, pX);
+    if (mandelbrotsplitcol(buffer+worstCol*SCREENHEIGHT, pX))
+    {
+        colXValues[worstCol] = pX;
+        colErrors[worstCol] = 0.0;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
 
-void fixworstrow(u16* buffer)
+bool fixworstrow(u16* buffer)
 {
     double worstError = 0.0;
     int worstRow = 0;
@@ -290,16 +336,24 @@ void fixworstrow(u16* buffer)
 
     double minY = targetY - size/2;
     double pY = minY + (worstRow * size) / SCREENHEIGHT;
-    rowYValues[worstRow] = pY;
-    rowErrors[worstRow] = 0.0;
-    mandelbrotrow(buffer+worstRow, pY);
+    if (mandelbrotsplitrow(buffer+worstRow, pY))
+    {
+        rowYValues[worstRow] = pY;
+        rowErrors[worstRow] = 0.0;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
+
 
 int main(void)
 {
     osSetSpeedupEnable(true);
 
-    gfxInit(GSP_RGB565_OES,GSP_BGR8_OES,false);
+    gfxInit(GSP_RGB565_OES,GSP_RGB565_OES,false);
     gfxSetDoubleBuffering(GFX_TOP, true);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     gfxSet3D(false);
@@ -311,7 +365,7 @@ int main(void)
     u16* oldBuffer;
     u16* buffer = (u16*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
 
-    u32 startTime = getusec();
+    startTime = getusec();
 	while (aptMainLoop() && !quit)
 	{
         oldBuffer = buffer;
@@ -330,25 +384,26 @@ int main(void)
             {
                 if (fixRowNext)
                 {
-                    fixworstrow(buffer);
+                    timeleft = fixworstrow(buffer);
                 }
                 else
                 {
-                    fixworstcol(buffer);
+                    timeleft = fixworstcol(buffer);
                 }
-                fixRowNext = !fixRowNext;
-                u32 usec = getusec()-startTime;
-                timeleft = usec < (1000000 * 2/4 / 60);
+                if (timeleft)
+                {
+                    fixRowNext = !fixRowNext;
+                }
             }
         }
 
-        u32 usec = getusec()-startTime;
+        u64 usec = getusec()-startTime;
 		gfxFlushBuffers();
 		gfxSwapBuffers();
 		gspWaitForVBlank();
-        u32 usecvsync = getusec()-startTime;
+        u64 usecvsync = getusec()-startTime;
         startTime = getusec();
-        printf("\x1b[u%ld  \x1b[u\x1b[1B%.16f  \x1b[u\x1b[2B%.16f  \x1b[u\x1b[3B%lld  \x1b[u\x1b[5B%ldms %ldfps  \x1b[u\x1b[6B%ldms %ldfps  ", iterations, targetX, targetY, (u64)(1/size), usec/1000, (2000000/usec+1)/2, usecvsync/1000, (2000000/usecvsync+1)/2);
+        printf("\x1b[u%d  \x1b[u\x1b[1B%.16f  \x1b[u\x1b[2B%.16f  \x1b[u\x1b[3B%lld  \x1b[u\x1b[5B%lldms %lldfps  \x1b[u\x1b[6B%lldms %lldfps  ", iterations, targetX, targetY, (u64)(1/size), usec/1000, (2000000/usec+1)/2, usecvsync/1000, (2000000/usecvsync+1)/2);
 
         Controls();
 	}
