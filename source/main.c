@@ -24,7 +24,7 @@ bool fixRowNext = true;
 u64 startTime;
 
 u8 fontData[fontTilesLen];
-u16 colourTable[COLOURTABLESIZE];
+u16* colourTable = NULL;
 double colXValues[SCREENWIDTH];
 double rowYValues[SCREENHEIGHT];
 double oldColXValues[SCREENWIDTH];
@@ -34,14 +34,21 @@ double rowErrors[SCREENHEIGHT];
 
 void InitColourTable()
 {
-    for (int i = 0; i < COLOURTABLESIZE; ++i)
+    if (colourTable)
     {
-        double u = (double)i / COLOURTABLESIZE;
+        free(colourTable);
+    }
+    colourTable = malloc(sizeof(u16) * (iterations+1));
+
+    for (int i = 0; i < iterations; ++i)
+    {
+        double u = (double)(i%COLOURTABLESIZE) / COLOURTABLESIZE;
         const u32 r = 255 * fmax(fmin(fabs(0.5-u)*6-1,1),0);
         const u32 g = 255 * fmax(fmin(fabs(0.5-fmod(u+2./3,1))*6-1,1),0);
         const u32 b = 255 * fmax(fmin(fabs(0.5-fmod(u+1./3,1))*6-1,1),0);
         colourTable[i] = ((r>>3)<<11) | ((g>>2)<<5) | ((b>>3)<<0);
     }
+    colourTable[iterations] = 0;
 }
 
 void InitConsole()
@@ -110,7 +117,7 @@ void Instructions()
         "        Imag pos :                     \n"
         "            Zoom :                     \n"
         "\n"
-        "           Frame :                     \n"
+        "          Strips :                     \n"
         "           Vsync :                     \n"
         "\n"
         "            By Movie Vertigo\n"
@@ -119,13 +126,42 @@ void Instructions()
     );
 }
 
+void Invalidate()
+{
+    double sizeX = (SCREENWIDTH * size) / SCREENHEIGHT;
+    double minX = targetX - sizeX/2;
+    double minY = targetY - size/2;
+    for (int row = 0; row < SCREENHEIGHT; ++row)
+    {
+        rowYValues[row] = minY + ((row+0.5*rand()/(double)RAND_MAX) * size) / SCREENHEIGHT;
+    }
+    for (int col = 0; col < SCREENWIDTH; ++col)
+    {
+        colXValues[col] = minX + ((col+0.5*rand()/(double)RAND_MAX) * sizeX) / SCREENWIDTH;
+    }
+}
+
+void SetIterations(int newIterations)
+{
+    iterations = newIterations;
+    InitColourTable();
+    Invalidate();
+}
+
 void Controls()
 {
     circlePosition circlePos;
     scanKeys();
 
-    int pressed = hidKeysHeld();
+    int pressed = hidKeysDownRepeat();
+    if (pressed & (KEY_X|KEY_Y))
+    {
+        if (pressed & KEY_X) SetIterations(iterations+1);
+        if (pressed & KEY_Y) SetIterations(iterations > 1 ? iterations-1 : iterations);
+        return;
+    }
 
+    pressed = hidKeysHeld();
     hidCircleRead(&circlePos);
     targetX += (circlePos.dx/16)*size/512;
     targetY += (circlePos.dy/16)*size/512;
@@ -149,7 +185,7 @@ inline int mandelbrotpixel(double pX, double pY)
     double x2 = x*x;
     double y2 = y*y;
 
-    int i = 0;
+    int i = -1;
     while (++i < iterations && x2 + y2 < 4.0)
     {
         y = pY + 2 * x * y;
@@ -175,7 +211,7 @@ inline bool mandelbrotsplitcol(u16* ptr, double pX)
         for (int row = start; row < end; ++row)
         {
             int i = mandelbrotpixel(pX, rowYValues[row]);
-            *ptr = i == iterations ? 0 : colourTable[i%COLOURTABLESIZE];
+            *ptr = colourTable[i];
             ++ptr;
         }
     }
@@ -198,7 +234,7 @@ inline bool mandelbrotsplitrow(u16* ptr, double pY)
         for (int col = start; col < end; ++col)
         {
             int i = mandelbrotpixel(colXValues[col], pY);
-            *ptr = i == iterations ? 0 : colourTable[i%COLOURTABLESIZE];
+            *ptr = colourTable[i];
             ptr += SCREENHEIGHT;
         }
     }
@@ -211,7 +247,7 @@ inline void mandelbrotrow(u16* ptr, double pY)
     for (int col = 0; col < SCREENWIDTH; ++col)
     {
         int i = mandelbrotpixel(colXValues[col], pY);
-        *ptr = i == iterations ? 0 : colourTable[i%COLOURTABLESIZE];
+        *ptr = colourTable[i];
         ptr += SCREENHEIGHT;
     }
 }
@@ -237,6 +273,8 @@ void fullmandelbrot(u16* buffer)
         mandelbrotrow(ptr, pY);
         ++ptr;
     }
+
+printf("\n\n\n%lldms for full", getusec()-startTime);
 }
 
 void scale(u16* srcBuffer, u16* dstBuffer)
@@ -357,6 +395,7 @@ int main(void)
     gfxSetDoubleBuffering(GFX_TOP, true);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     gfxSet3D(false);
+    hidSetRepeatParameters(16,1);
 
     InitConsole();
     InitColourTable();
@@ -365,6 +404,7 @@ int main(void)
     u16* oldBuffer;
     u16* buffer = (u16*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
 
+    int strips = 0;
     startTime = getusec();
 	while (aptMainLoop() && !quit)
 	{
@@ -380,6 +420,15 @@ int main(void)
         {
             scale(oldBuffer, buffer);
             bool timeleft = true;
+            strips = 0;
+/*for (int i = 0; i < SCREENHEIGHT; ++i)
+{
+    rowErrors[i] = 1.0;
+}
+for (int i = 0; i < SCREENWIDTH; ++i)
+{
+    colErrors[i] = 1.0;
+}*/
             while (timeleft)
             {
                 if (fixRowNext)
@@ -393,17 +442,17 @@ int main(void)
                 if (timeleft)
                 {
                     fixRowNext = !fixRowNext;
+                    ++strips;
                 }
             }
         }
 
-        u64 usec = getusec()-startTime;
 		gfxFlushBuffers();
 		gfxSwapBuffers();
 		gspWaitForVBlank();
         u64 usecvsync = getusec()-startTime;
         startTime = getusec();
-        printf("\x1b[u%d  \x1b[u\x1b[1B%.16f  \x1b[u\x1b[2B%.16f  \x1b[u\x1b[3B%lld  \x1b[u\x1b[5B%lldms %lldfps  \x1b[u\x1b[6B%lldms %lldfps  ", iterations, targetX, targetY, (u64)(1/size), usec/1000, (2000000/usec+1)/2, usecvsync/1000, (2000000/usecvsync+1)/2);
+        printf("\x1b[u%d  \x1b[u\x1b[1B%.16f  \x1b[u\x1b[2B%.16f  \x1b[u\x1b[3B%lld  \x1b[u\x1b[5B%d  \x1b[u\x1b[6B%lldms %lldfps  ", iterations, targetX, targetY, (u64)(4/size), strips, usecvsync/1000, (2000000/usecvsync+1)/2);
 
         Controls();
 	}
