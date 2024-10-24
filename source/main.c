@@ -7,48 +7,75 @@
 
 #define SCREENWIDTH 400
 #define SCREENHEIGHT 240
-#define INITIALITERATIONS 256
+#define ITERATIONSNEW3DS 256
+#define ITERATIONSOLD3DS 128
 #define INITIALTARGETX -0.5
 #define INITIALTARGETY 0.0
 #define INITIALSIZE 3.1
 #define COLOURTABLESIZE 64
 #define TIMELIMIT (1000000 * 88/100 / 60)
-#define SPLITS 8
+#define THREADSTACKSIZE (4 * 1024)
 
 double targetX = INITIALTARGETX, targetY = INITIALTARGETY, size = INITIALSIZE;
-int iterations = INITIALITERATIONS;
+volatile int iterations;
 
+bool new3DS = true;
 bool quit = false;
 bool drawfull = true;
 bool fixRowNext = true;
+int colCycle = 0;
+int rowCycle = 0;
 u64 startTime;
 
+#define MAXCORECOUNT 4
+Thread threads[MAXCORECOUNT];
+volatile int threadJob[MAXCORECOUNT];
+u16* volatile threadBuffer;
+volatile double threadPX;
+volatile double threadPY;
+int coreCount;
+volatile bool runThreads = false;
+volatile bool timeLeft = false;
+
+
 u8 fontData[fontTilesLen];
-u16* colourTable = NULL;
+u16 colourTable[COLOURTABLESIZE];
 double colXValues[SCREENWIDTH];
 double rowYValues[SCREENHEIGHT];
 double oldColXValues[SCREENWIDTH];
 double oldRowYValues[SCREENHEIGHT];
 double colErrors[SCREENWIDTH];
 double rowErrors[SCREENHEIGHT];
+int colRand[SCREENWIDTH];
+int rowRand[SCREENHEIGHT];
+
+void InitRand(int* table, int count)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        table[i] = i;
+    }
+    
+    for (int i = count-1; i > 0; --i)
+    {
+        int j = rand() % (i + 1);
+        
+        int temp = table[i];
+        table[i] = table[j];
+        table[j] = temp;
+    }
+}
 
 void InitColourTable()
 {
-    if (colourTable)
+    for (int i = 0; i < COLOURTABLESIZE; ++i)
     {
-        free(colourTable);
-    }
-    colourTable = malloc(sizeof(u16) * (iterations+1));
-
-    for (int i = 0; i < iterations; ++i)
-    {
-        double u = (double)(i%COLOURTABLESIZE) / COLOURTABLESIZE;
+        double u = (double)i / COLOURTABLESIZE;
         const u32 r = 255 * fmax(fmin(fabs(0.5-u)*6-1,1),0);
         const u32 g = 255 * fmax(fmin(fabs(0.5-fmod(u+2./3,1))*6-1,1),0);
         const u32 b = 255 * fmax(fmin(fabs(0.5-fmod(u+1./3,1))*6-1,1),0);
         colourTable[i] = ((r>>3)<<11) | ((g>>2)<<5) | ((b>>3)<<0);
     }
-    colourTable[iterations] = 0;
 }
 
 void InitConsole()
@@ -90,62 +117,47 @@ void ColourText(int x1, int y1, int x2, int y2, int xo, int yo)
     }
 }
 
-void Instructions()
+void Instructions(bool logo)
 {
-    consoleGetDefault()->cursorX = 0;
-    consoleGetDefault()->cursorY = 0;
+    iprintf("\x1b[1;1H");
 
-    for (int i = 128; i < 224; ++i)
+    if (logo)
     {
-        if (!(i%32))
+        for (int i = 128; i < 224; ++i)
         {
-            iprintf("\n    ");
+            if (!(i%32))
+            {
+                iprintf("\n    ");
+            }
+            iprintf("%c",i);
         }
-    	iprintf("%c",i);
+        ColourText(32, 8+3, 320-32, 32-3, 0, 0);
     }
-    ColourText(32, 8+3, 320-32, 32-3, 0, 0);
-	printf(
-        "\n\n"
+    else
+    {
+        iprintf("\n\n\n");
+    }
+
+	iprintf(
+        "\n\n\n\n"
         "      Circle-Pad : Move around\n"
         "             A/B : Zoom in/out\n"
         "             X/Y : Inc/dec iterations\n"
         "          Select : Reset view\n"
         "           Start : Exit\n"
-        "\n"
+        "\n\n"
         " Iteration count : \x1b[s                    \n"
         "        Real pos :                     \n"
         "        Imag pos :                     \n"
         "            Zoom :                     \n"
         "\n"
         "          Strips :                     \n"
-        "           Vsync :                     \n"
-        "\n"
+        "            Time :                     \n"
+        "\n\n\n\n"
         "            By Movie Vertigo\n"
         "        youtube.com/movievertigo\n"
         "        twitter.com/movievertigo"
     );
-}
-
-void Invalidate()
-{
-    double sizeX = (SCREENWIDTH * size) / SCREENHEIGHT;
-    double minX = targetX - sizeX/2;
-    double minY = targetY - size/2;
-    for (int row = 0; row < SCREENHEIGHT; ++row)
-    {
-        rowYValues[row] = minY + ((row+0.5*rand()/(double)RAND_MAX) * size) / SCREENHEIGHT;
-    }
-    for (int col = 0; col < SCREENWIDTH; ++col)
-    {
-        colXValues[col] = minX + ((col+0.5*rand()/(double)RAND_MAX) * sizeX) / SCREENWIDTH;
-    }
-}
-
-void SetIterations(int newIterations)
-{
-    iterations = newIterations;
-    InitColourTable();
-    Invalidate();
 }
 
 void Controls()
@@ -156,8 +168,8 @@ void Controls()
     int pressed = hidKeysDownRepeat();
     if (pressed & (KEY_X|KEY_Y))
     {
-        if (pressed & KEY_X) SetIterations(iterations+1);
-        if (pressed & KEY_Y) SetIterations(iterations > 1 ? iterations-1 : iterations);
+        if (pressed & KEY_X) ++iterations;
+        if (pressed & KEY_Y) iterations = iterations > 1 ? iterations-1 : iterations;
         return;
     }
 
@@ -169,7 +181,12 @@ void Controls()
     if (pressed & KEY_B) size /= 0.99;
 
     pressed = hidKeysDown();
-    if (pressed & KEY_SELECT) { size = INITIALSIZE; targetX = INITIALTARGETX; targetY = INITIALTARGETY; drawfull = true; }
+    if (pressed & KEY_SELECT)
+    {
+        drawfull = true;
+        size = INITIALSIZE; targetX = INITIALTARGETX; targetY = INITIALTARGETY;
+        iterations = new3DS ? ITERATIONSNEW3DS : ITERATIONSOLD3DS;
+    }
     if (pressed & KEY_START) { quit = true; }
 }
 
@@ -184,6 +201,8 @@ inline int mandelbrotpixel(double pX, double pY)
     double y = pY;
     double x2 = x*x;
     double y2 = y*y;
+    double q = (x-0.25)*(x-0.25)+y2;
+    if (q*(q+x-0.25) <= 0.25*y2 || (x+1.0)*(x+1.0)+y2 <= 0.0625) return iterations;
 
     int i = -1;
     while (++i < iterations && x2 + y2 < 4.0)
@@ -196,59 +215,70 @@ inline int mandelbrotpixel(double pX, double pY)
     return i;
 }
 
-inline bool mandelbrotsplitcol(u16* ptr, double pX)
+inline void threadcol(u16* ptr, double pX, int rowStart, int rowStep)
 {
-    for (int split = 0; split < SPLITS; ++split)
+    for (int row = rowStart; timeLeft && row < SCREENHEIGHT; row += rowStep)
     {
-        if (getusec()-startTime > TIMELIMIT)
-        {
-            return false;
-        }
-
-        int start = split * (SCREENHEIGHT/SPLITS);
-        int end = (split+1) * (SCREENHEIGHT/SPLITS);
-
-        for (int row = start; row < end; ++row)
-        {
-            int i = mandelbrotpixel(pX, rowYValues[row]);
-            *ptr = colourTable[i];
-            ++ptr;
-        }
+        int i = mandelbrotpixel(pX, rowYValues[row]);
+        *ptr = (i == iterations ? 0 : colourTable[i%COLOURTABLESIZE]);
+        ptr += rowStep;
     }
-
-    return true;
 }
 
-inline bool mandelbrotsplitrow(u16* ptr, double pY)
+inline void threadrow(u16* ptr, double pY, int colStart, int colStep)
 {
-    for (int split = 0; split < SPLITS; ++split)
-    {
-        if (getusec()-startTime > TIMELIMIT)
-        {
-            return false;
-        }
-
-        int start = split * (SCREENWIDTH/SPLITS);
-        int end = (split+1) * (SCREENWIDTH/SPLITS);
-    
-        for (int col = start; col < end; ++col)
-        {
-            int i = mandelbrotpixel(colXValues[col], pY);
-            *ptr = colourTable[i];
-            ptr += SCREENHEIGHT;
-        }
-    }
-
-    return true;
-}
-
-inline void mandelbrotrow(u16* ptr, double pY)
-{
-    for (int col = 0; col < SCREENWIDTH; ++col)
+    for (int col = colStart; timeLeft && col < SCREENWIDTH; col += colStep)
     {
         int i = mandelbrotpixel(colXValues[col], pY);
-        *ptr = colourTable[i];
-        ptr += SCREENHEIGHT;
+        *ptr = (i == iterations ? 0 : colourTable[i%COLOURTABLESIZE]);
+        ptr += colStep * SCREENHEIGHT;
+    }
+}
+
+void mandelbrotcol(u16* ptr, double pX)
+{
+    threadBuffer = ptr;
+    threadPX = pX;
+    __dsb();
+    for (int core = 1; core < coreCount; ++core)
+    {
+        threadJob[core] = 1;
+    }
+
+    for (int row = 0; timeLeft && row < SCREENHEIGHT; row += coreCount)
+    {
+        int i = mandelbrotpixel(pX, rowYValues[row]);
+        *ptr = (i == iterations ? 0 : colourTable[i%COLOURTABLESIZE]);
+        ptr += coreCount;
+    }
+
+    for (int core = 1; core < coreCount; ++core)
+    {
+        while (threadJob[core]);
+    }
+}
+
+
+void mandelbrotrow(u16* ptr, double pY)
+{
+    threadBuffer = ptr;
+    threadPY = pY;
+    __dsb();
+    for (int core = 1; core < coreCount; ++core)
+    {
+        threadJob[core] = 2;
+    }
+
+    for (int col = 0; timeLeft && col < SCREENWIDTH; col += coreCount)
+    {
+        int i = mandelbrotpixel(colXValues[col], pY);
+        *ptr = (i == iterations ? 0 : colourTable[i%COLOURTABLESIZE]);
+        ptr += coreCount * SCREENHEIGHT;
+    }
+
+    for (int core = 1; core < coreCount; ++core)
+    {
+        while (threadJob[core]);
     }
 }
 
@@ -273,8 +303,6 @@ void fullmandelbrot(u16* buffer)
         mandelbrotrow(ptr, pY);
         ++ptr;
     }
-
-printf("\n\n\n%lldms for full", getusec()-startTime);
 }
 
 void scale(u16* srcBuffer, u16* dstBuffer)
@@ -344,19 +372,19 @@ bool fixworstcol(u16* buffer)
         }
     }
 
+    if (worstError == 0.0)
+    {
+        worstCol = colRand[++colCycle % SCREENWIDTH];
+    }
+
     double sizeX = (SCREENWIDTH * size) / SCREENHEIGHT;
     double minX = targetX - sizeX/2;
     double pX = minX + (worstCol * sizeX) / SCREENWIDTH;
-    if (mandelbrotsplitcol(buffer+worstCol*SCREENHEIGHT, pX))
-    {
-        colXValues[worstCol] = pX;
-        colErrors[worstCol] = 0.0;
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    mandelbrotcol(buffer+worstCol*SCREENHEIGHT, pX);
+    colXValues[worstCol] = pX;
+    colErrors[worstCol] = 0.0;
+
+    return worstError != 0.0;
 }
 
 bool fixworstrow(u16* buffer)
@@ -372,24 +400,82 @@ bool fixworstrow(u16* buffer)
         }
     }
 
+    if (worstError == 0.0)
+    {
+        worstRow = rowRand[++rowCycle % SCREENHEIGHT];
+    }
+
     double minY = targetY - size/2;
     double pY = minY + (worstRow * size) / SCREENHEIGHT;
-    if (mandelbrotsplitrow(buffer+worstRow, pY))
+    mandelbrotrow(buffer+worstRow, pY);
+    rowYValues[worstRow] = pY;
+    rowErrors[worstRow] = 0.0;
+
+    return worstError != 0.0;
+}
+
+void threadFunc(void *arg)
+{
+	int core = (int)arg;
+
+	while (runThreads)
+	{
+        switch (threadJob[core])
+        {
+            case 1:
+            {
+                threadcol(threadBuffer+core, threadPX, core, coreCount);
+                threadJob[core] = 0;
+                break;
+            }
+            case 2:
+            {
+                threadrow(threadBuffer+core*SCREENHEIGHT, threadPY, core, coreCount);
+                threadJob[core] = 0;
+                break;
+            }
+        }
+	}
+}
+
+void InitThreads()
+{
+    for (int percent = 100; percent > 1 && APT_SetAppCpuTimeLimit(percent) != 0; --percent) {}
+    coreCount = new3DS ? 4 : 2;
+
+	runThreads = true;
+    for (int core = 1; core < coreCount; ++core)
     {
-        rowYValues[worstRow] = pY;
-        rowErrors[worstRow] = 0.0;
-        return true;
-    }
-    else
-    {
-        return false;
+        threadJob[core] = 0;
+        __dsb();
+        threads[core] = threadCreate(threadFunc, (void*)core, THREADSTACKSIZE, 0x3F, core, false);
     }
 }
 
+void StopThreads()
+{
+	runThreads = false;
+    for (int core = 1; core < coreCount; ++core)
+    {
+		threadJoin(threads[core], U64_MAX);
+		threadFree(threads[core]);
+    }
+}
+
+void onVBlank()
+{
+	if (!drawfull)
+    {
+        gfxSwapBuffers();
+    }
+    timeLeft = drawfull;
+}
 
 int main(void)
 {
     osSetSpeedupEnable(true);
+    APT_CheckNew3DS(&new3DS);
+    iterations = new3DS ? ITERATIONSNEW3DS : ITERATIONSOLD3DS;
 
     gfxInit(GSP_RGB565_OES,GSP_RGB565_OES,false);
     gfxSetDoubleBuffering(GFX_TOP, true);
@@ -398,65 +484,68 @@ int main(void)
     hidSetRepeatParameters(16,1);
 
     InitConsole();
+    InitRand(colRand, SCREENWIDTH);
+    InitRand(rowRand, SCREENHEIGHT);
     InitColourTable();
-    Instructions();
+    Instructions(true);
+    InitThreads();
 
-    u16* oldBuffer;
-    u16* buffer = (u16*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
+    u16* backBuffer;
+    u16* frontBuffer = (u16*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
+    gfxSwapBuffers();
+
+    gspSetEventCallback(GSPGPU_EVENT_VBlank0, onVBlank, NULL, false);
 
     int strips = 0;
     startTime = getusec();
 	while (aptMainLoop() && !quit)
 	{
-        oldBuffer = buffer;
-        buffer = (u16*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
+        backBuffer = frontBuffer;
+        frontBuffer = (u16*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
 
         if (drawfull)
         {
-            fullmandelbrot(buffer);
+            timeLeft = true;
+            gfxSwapBuffers();
+            fullmandelbrot(backBuffer);
+            gspWaitForVBlank();
+            gfxSwapBuffers();
+            memcpy(frontBuffer, backBuffer, sizeof(u16) * SCREENWIDTH * SCREENHEIGHT);
             drawfull = false;
+            while (timeLeft);
+            Instructions(false);
         }
         else
         {
-            scale(oldBuffer, buffer);
-            bool timeleft = true;
+            scale(frontBuffer, backBuffer);
+            timeLeft = true;
             strips = 0;
-/*for (int i = 0; i < SCREENHEIGHT; ++i)
-{
-    rowErrors[i] = 1.0;
-}
-for (int i = 0; i < SCREENWIDTH; ++i)
-{
-    colErrors[i] = 1.0;
-}*/
-            while (timeleft)
+            bool anyFixesNeeded = false;
+            while (timeLeft)
             {
-                if (fixRowNext)
-                {
-                    timeleft = fixworstrow(buffer);
-                }
-                else
-                {
-                    timeleft = fixworstcol(buffer);
-                }
-                if (timeleft)
+                bool fixNeeded = fixRowNext ? fixworstrow(backBuffer) : fixworstcol(backBuffer);
+                anyFixesNeeded |= fixNeeded;
+                if (timeLeft)
                 {
                     fixRowNext = !fixRowNext;
                     ++strips;
                 }
             }
+            if (!anyFixesNeeded)
+            {
+                // Allows home button and lid closing to work
+                svcSleepThread(1);
+            }
         }
 
-		gfxFlushBuffers();
-		gfxSwapBuffers();
-		gspWaitForVBlank();
-        u64 usecvsync = getusec()-startTime;
+        u64 usec = getusec()-startTime;
         startTime = getusec();
-        printf("\x1b[u%d  \x1b[u\x1b[1B%.16f  \x1b[u\x1b[2B%.16f  \x1b[u\x1b[3B%lld  \x1b[u\x1b[5B%d  \x1b[u\x1b[6B%lldms %lldfps  ", iterations, targetX, targetY, (u64)(4/size), strips, usecvsync/1000, (2000000/usecvsync+1)/2);
+        printf("\x1b[u%d  \x1b[u\x1b[1B%.16f  \x1b[u\x1b[2B%.16f  \x1b[u\x1b[3B%lld  \x1b[u\x1b[5B%d  \x1b[u\x1b[6B%lldms %lldfps  ", iterations, targetX, targetY, (u64)(4/size), strips, usec/1000, (2000000/usec+1)/2);
 
         Controls();
 	}
 
+    StopThreads();
 	gfxExit();
 	return 0;
 }
